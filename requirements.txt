@@ -17,3 +17,4 @@ charset-normalizer==3.4.7
 et_xmlfile==2.0.0
 pillow==12.2.0
 packaging==25.0
+pywebpush==2.5.0
