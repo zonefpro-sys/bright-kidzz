@@ -922,6 +922,11 @@ upgrade_db_reduction_precision()
 # • Les pourcentages sont stockés sur la fiche (reduction_pourcentage / reduction_transport_pourcentage),
 #   donc la génération des factures, la resynchronisation et le reçu PDF restent INCHANGÉS.
 # • Élèves déjà abonnés avant ce changement : transport_tarif vide = tarif conservé tel quel.
+# • 🆕 3e possibilité, tarif 'separe' (« montant de transport saisi ») : le « montant convenu » est la
+#   scolarité SEULE et le montant net du transport est saisi à part. Il est comparé à la référence
+#   (300 DH) : l'écart devient la réduction transport (montant_transport = 300,
+#   reduction_transport_pourcentage = (300 − saisi) / 300). La réduction scolarité reste inchangée.
+#   Si le montant saisi dépasse 300, il est facturé tel quel (sans réduction transport).
 TRANSPORT_MONTANT_FIXE = 300.0
 TRANSPORT_REDUCTION_INCLUS = 200.0       # réduction sur le transport (300 → 100) quand le convenu l'inclut
 TRANSPORT_REDUCTION_SUPPLEMENT = 100.0   # réduction sur le transport (300 → 200) en « calcul normal »
@@ -941,7 +946,8 @@ def upgrade_db_transport_tarif():
 upgrade_db_transport_tarif()
 
 
-def _calculer_regle_transport(mensualite, reduction_pct, convenu, transport_abonne, tarif, ancien=None):
+def _calculer_regle_transport(mensualite, reduction_pct, convenu, transport_abonne, tarif, ancien=None,
+                              montant_separe=None):
     """Retourne (montant_transport, reduction_pourcentage, reduction_transport_pourcentage, tarif_a_stocker)."""
     try:
         M = float(mensualite or 0)
@@ -954,6 +960,24 @@ def _calculer_regle_transport(mensualite, reduction_pct, convenu, transport_abon
     if transport_abonne != 'oui':
         return 0.0, r, 0.0, None
     T = TRANSPORT_MONTANT_FIXE
+    if tarif == 'separe':
+        # 🆕 Montant de transport saisi : « convenu » = scolarité seule, transport ajouté à la facture.
+        try:
+            X = float(montant_separe) if montant_separe not in (None, '') else None
+        except (TypeError, ValueError):
+            X = None
+        if X is None:
+            # Pas de montant dans le formulaire : on garde le net déjà enregistré (élève déjà en « saisi »).
+            X = (float(ancien['montant_transport'] or 0) * (1 - float(ancien['reduction_transport_pourcentage'] or 0) / 100.0)
+                 if (ancien is not None and ancien['transport_tarif'] == 'separe') else 0.0)
+        X = max(X, 0.0)
+        if convenu is not None and M > 0:
+            r = round(max(0.0, min(100.0, (M - convenu) / M * 100.0)), 8)
+        if X >= T:
+            # Montant saisi ≥ référence : pas de réduction, on facture le montant saisi.
+            return X, r, 0.0, 'separe'
+        # Montant saisi < 300 : l'écart avec la référence devient la réduction transport.
+        return T, r, round((T - X) / T * 100.0, 8), 'separe'
     if tarif == 'legacy' and ancien is not None:
         # Ancien abonné : montant et réduction transport conservés tels quels.
         return (float(ancien['montant_transport'] or 0), r,
@@ -990,10 +1014,18 @@ def _regle_transport_depuis_form(conn, eleve_id, form, montant_mensualite, reduc
             "FROM eleves WHERE id=?", (eleve_id,)).fetchone()
     deja_abonne = bool(ancien and ancien['transport_abonne'] == 'oui')
     tarif = (form.get('transport_tarif') or '').strip()
-    if tarif not in ('inclus', 'supplement', 'legacy'):
+    if tarif not in ('inclus', 'supplement', 'legacy', 'separe'):
         tarif = (ancien['transport_tarif'] or 'legacy') if deja_abonne else 'inclus'
     if tarif == 'legacy' and not deja_abonne:
         tarif = 'inclus'
+    # 🆕 Type désactivé par l'admin : une nouvelle souscription ne peut pas l'utiliser (formulaire périmé).
+    # Un élève déjà enregistré avec ce type le conserve. Bascule uniquement entre types 1 et 2.
+    if tarif in ('inclus', 'supplement') and not (deja_abonne and (ancien['transport_tarif'] or '') == tarif):
+        _act = get_transport_types_actifs(conn)
+        if not _act.get(tarif, True):
+            _autre = 'supplement' if tarif == 'inclus' else 'inclus'
+            if _act.get(_autre, False):
+                tarif = _autre
     if tarif == 'inclus' and deja_abonne and raw is None:
         # Formulaire périmé sans « montant convenu » : on ne retouche pas la réduction transport.
         try:
@@ -1003,7 +1035,8 @@ def _regle_transport_depuis_form(conn, eleve_id, form, montant_mensualite, reduc
         return (TRANSPORT_MONTANT_FIXE, r0,
                 float(ancien['reduction_transport_pourcentage'] or 0), 'inclus')
     return _calculer_regle_transport(montant_mensualite, reduction_pct, convenu,
-                                     transport_abonne, tarif, ancien)
+                                     transport_abonne, tarif, ancien,
+                                     montant_separe=form.get('montant_transport_separe'))
 
 
 # 🆕 ÉLÈVES SORTANTS : un élève peut quitter l'école en cours d'année (annulation de la scolarité,
@@ -2845,6 +2878,59 @@ def upgrade_db_nom_ecole():
 
 
 upgrade_db_nom_ecole()
+
+
+# 🆕 Types de calcul du transport activables par l'admin (page Profil) :
+#   type 1 = 'inclus' (transport à 100 MAD net), type 2 = 'supplement' (200 MAD net),
+#   type 3 = 'separe' (montant de transport saisi). Stocké dans parametres_ecole.transport_types_actifs.
+TRANSPORT_TYPES_CLES = ('inclus', 'supplement', 'separe')
+
+
+def upgrade_db_transport_types():
+    if not os.path.exists(DB_PATH): return
+    conn = get_db()
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(parametres_ecole)").fetchall()]
+        if cols and 'transport_types_actifs' not in cols:
+            conn.execute("ALTER TABLE parametres_ecole ADD COLUMN transport_types_actifs TEXT DEFAULT 'inclus,supplement,separe'")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Erreur migration types de transport : {e}")
+    finally:
+        conn.close()
+
+
+upgrade_db_transport_types()
+
+
+def get_transport_types_actifs(conn=None):
+    """Retourne {'inclus': bool, 'supplement': bool, 'separe': bool}. Par défaut (ou en cas de
+    valeur absente / invalide) les 3 types sont actifs : aucun changement tant que l'admin n'a rien réglé."""
+    tout = {k: True for k in TRANSPORT_TYPES_CLES}
+    _own = conn is None
+    try:
+        if _own:
+            conn = get_db()
+        row = conn.execute("SELECT transport_types_actifs FROM parametres_ecole WHERE id=1").fetchone()
+        brut = (row['transport_types_actifs'] if row else None)
+        if not brut:
+            return tout
+        actifs = {k.strip() for k in str(brut).split(',') if k.strip()}
+        res = {k: (k in actifs) for k in TRANSPORT_TYPES_CLES}
+        return res if any(res.values()) else tout
+    except Exception:
+        return tout
+    finally:
+        if _own and conn is not None:
+            try: conn.close()
+            except Exception: pass
+
+
+@app.context_processor
+def inject_transport_types():
+    # Rend `TRANSPORT_TYPES_ACTIFS` disponible dans tous les templates (formulaires élève, page Profil)
+    return {'TRANSPORT_TYPES_ACTIFS': get_transport_types_actifs()}
 
 
 # 🆕 Alertes du dashboard admin marquées comme "traitées" — permet à l'admin/agent admin de
@@ -19597,16 +19683,25 @@ def _reduction_est_valide(mois):
 
 
 def _snapshot_scolarite(conn, eleve_id):
-    """Photo des champs « scolarité » de la fiche élève (montant de référence + réduction), pour
-    savoir après une modification si le montant de scolarité a réellement changé."""
+    """Photo des champs « scolarité » + « transport » de la fiche élève (montant de référence,
+    réduction, abonnement transport, montant et réduction transport), pour savoir après une
+    modification si le montant des factures a réellement changé."""
     r = conn.execute(
-        "SELECT montant_mensualite, reduction_pourcentage, reduction_validite FROM eleves WHERE id=?",
+        "SELECT montant_mensualite, reduction_pourcentage, reduction_validite, "
+        "transport_abonne, transport_tarif, montant_transport, reduction_transport_pourcentage FROM eleves WHERE id=?",
         (eleve_id,)).fetchone()
     if not r:
         return None
+    # 🆕 Le transport fait partie de la photo : abonnement / désabonnement, montant ou réduction
+    # transport modifiés (tous tarifs) déclenchent aussi la mise à jour des factures « Non payé ».
+    _abonne = (r['transport_abonne'] == 'oui')
+    _transport = (round(float(r['montant_transport'] or 0), 2),
+                  round(float(r['reduction_transport_pourcentage'] or 0), 6)) if _abonne else None
     return (round(float(r['montant_mensualite'] or 0), 2),
             round(float(r['reduction_pourcentage'] or 0), 6),
-            str(r['reduction_validite'] or ''))
+            str(r['reduction_validite'] or ''),
+            _abonne,
+            _transport)
 
 
 def _resynchroniser_factures_non_payees(conn, eleve_id):
@@ -34620,7 +34715,12 @@ def export_recu_pdf(paiement_id):
             if os.path.exists(candidate):
                 banniere_path = candidate
 
-        reste = p['montant_total'] - p['montant_paye']
+        # 🩹 « Reste à payer » net de la régule éventuelle (élève sortant : ce qui a été rendu n'est plus dû)
+        try:
+            _regule_recu = float(p['montant_regule'] or 0)
+        except (IndexError, KeyError, TypeError, ValueError):
+            _regule_recu = 0.0
+        reste = max(p['montant_total'] - _regule_recu - p['montant_paye'], 0.0)
         statut = (p['statut'] or '').lower()
         if statut == 'paye':
             statut_label, statut_hex = 'PAYÉ INTÉGRALEMENT', _BULLETIN_GREEN
@@ -34718,30 +34818,51 @@ def export_recu_pdf(paiement_id):
             pct_scol = float(m_scol.group(1).replace(',', '.')) if m_scol else 0.0
             pct_trans = float(m_trans.group(1).replace(',', '.')) if m_trans else 0.0
 
-            # 🩹 CORRECTIF : si le libellé de la facture ne contient pas (ou plus) le
-            # pourcentage exploitable — anciennes factures, wording différent, etc. — on se
-            # rabat sur le pourcentage de réduction actuellement configuré sur la fiche élève,
-            # pour que le sous-total après réduction s'affiche toujours quand une réduction a
-            # bien été appliquée (au lieu de la faire disparaître silencieusement).
-            if pct_scol <= 0:
-                try:
-                    pct_scol = float(p['eleve_reduction_pourcentage'] or 0)
-                except (IndexError, KeyError, TypeError, ValueError):
-                    pct_scol = 0.0
-            if pct_trans <= 0:
-                try:
-                    pct_trans = float(p['eleve_reduction_transport_pourcentage'] or 0)
-                except (IndexError, KeyError, TypeError, ValueError):
-                    pct_trans = 0.0
-
             scolarite_net = round((p['montant_total'] or 0) - montant_transport_p, 2)
             transport_net = montant_transport_p
 
-            scolarite_brut = round(scolarite_net / (1 - pct_scol / 100), 2) if pct_scol > 0 else scolarite_net
-            reduction_scol_montant = round(scolarite_brut - scolarite_net, 2) if pct_scol > 0 else 0.0
+            # 🩹 CORRECTIF : les montants de réduction s'appuient sur la réduction RÉELLEMENT enregistrée
+            # sur la facture (reduction_appliquee), et non plus sur le pourcentage actuel de la fiche élève.
+            # Avant : une facture sans réduction (ex. août) affichait une réduction fictive, et une réduction
+            # de 100 % provoquait une division par zéro (le reçu ne s'ouvrait pas).
+            def _red_depuis_pct(net, pct):
+                return round(net / (1 - pct / 100) - net, 2) if 0 < pct < 100 else None
 
-            transport_brut = round(transport_net / (1 - pct_trans / 100), 2) if pct_trans > 0 else transport_net
-            reduction_trans_montant = round(transport_brut - transport_net, 2) if pct_trans > 0 else 0.0
+            red_s = red_t = 0.0
+            if reduction_appliquee > 0.004:
+                red_s_c = _red_depuis_pct(scolarite_net, pct_scol)
+                red_t_c = _red_depuis_pct(transport_net, pct_trans)
+                if red_s_c is None and red_t_c is None:
+                    # Ancien libellé sans pourcentage : on tente ceux de la fiche élève, mais seulement
+                    # s'ils retombent sur la réduction réellement enregistrée.
+                    try:
+                        _fs = float(p['eleve_reduction_pourcentage'] or 0)
+                        _ft = float(p['eleve_reduction_transport_pourcentage'] or 0)
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        _fs = _ft = 0.0
+                    _cs, _ct = _red_depuis_pct(scolarite_net, _fs), _red_depuis_pct(transport_net, _ft)
+                    if (_cs or _ct) and abs((_cs or 0) + (_ct or 0) - reduction_appliquee) <= 0.05:
+                        red_s_c, red_t_c = _cs, _ct
+                if red_s_c is None and red_t_c is None:
+                    red_s_c = reduction_appliquee      # attribuée à la scolarité (montant enregistré)
+                _reste_red = round(reduction_appliquee - (red_s_c or 0) - (red_t_c or 0), 2)
+                if _reste_red > 0.004:
+                    # Poste sans pourcentage exploitable (ex. 100 %) : il prend le reste enregistré.
+                    if red_t_c is None and red_s_c is not None:
+                        red_t_c = _reste_red
+                    elif red_s_c is None and red_t_c is not None:
+                        red_s_c = _reste_red
+                red_s, red_t = (red_s_c or 0.0), (red_t_c or 0.0)
+
+            scolarite_brut = round(scolarite_net + red_s, 2)
+            reduction_scol_montant = red_s
+            transport_brut = round(transport_net + red_t, 2)
+            reduction_trans_montant = red_t
+            # Pourcentage affiché : celui du libellé s'il est exploitable, sinon déduit des montants.
+            if red_s > 0 and not (0 < pct_scol < 100):
+                pct_scol = round(red_s / scolarite_brut * 100, 2) if scolarite_brut > 0 else 0.0
+            if red_t > 0 and not (0 < pct_trans < 100):
+                pct_trans = round(red_t / transport_brut * 100, 2) if transport_brut > 0 else 0.0
 
             # 🆕 Détail complet ligne par ligne (montant initial → réduction → montant après
             # réduction) pour la scolarité PUIS pour le transport, chaque bloc teinté d'un fond
@@ -35213,6 +35334,32 @@ def profile():
             conn.commit()
             conn.close()
             flash('Systèmes de notation enregistrés.' if nb else 'Aucun changement.', 'success')
+            return redirect(url_for('profile'))
+        # 🆕 Admin : activer / désactiver les types de calcul du transport (1, 2, 3)
+        if f.get('action') == 'transport_types':
+            if session.get('role') != 'admin':
+                flash('Action non autorisée.', 'error')
+                conn.close()
+                return redirect(url_for('profile'))
+            choisis = [k for k in TRANSPORT_TYPES_CLES if f.get('type_' + k)]
+            if not choisis:
+                flash('Au moins un type de calcul du transport doit rester activé.', 'error')
+                conn.close()
+                return redirect(url_for('profile'))
+            try:
+                upgrade_db_transport_types()
+                avant = get_transport_types_actifs(conn)
+                conn.execute("UPDATE parametres_ecole SET transport_types_actifs=? WHERE id=1", (','.join(choisis),))
+                log_action(conn, 'modification', 'parametres', 1,
+                           "Types de transport actifs : " + ', '.join(
+                               f"{k}={'oui' if k in choisis else 'non'}" for k in TRANSPORT_TYPES_CLES)
+                           + " (avant : " + ', '.join(f"{k}={'oui' if v else 'non'}" for k, v in avant.items()) + ")")
+                conn.commit()
+                flash('Types de calcul du transport enregistrés ✓', 'success')
+            except Exception as e:
+                conn.rollback()
+                flash(f"Erreur lors de l'enregistrement : {e}", 'error')
+            conn.close()
             return redirect(url_for('profile'))
         if f.get('new_password'):
             old = hash_pw(f.get('old_password', ''))
@@ -46607,12 +46754,20 @@ html.theme-neon .me-al{ background:color-mix(in srgb,var(--c) 12%,rgba(18,18,32,
              </div>
              <div class="form-group" id="edit_eleve_div_montant" style="display:none;grid-column:1/-1;">
           <label>🚌 Transport</label>
-          <div style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;"><span id="edit_eleve_transport_info">Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » inclut le transport (100 MAD net + 200 MAD de réduction).</span></div>
+          <div id="edit_eleve_tarif_infobox" style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;"><span id="edit_eleve_transport_info">Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » inclut le transport (100 MAD net + 200 MAD de réduction).</span></div>
           <input type="hidden" name="transport_tarif" id="edit_eleve_tarif" value="inclus">
           <div id="edit_eleve_choix" style="display:none;margin-top:8px;padding:8px 10px;border:1px dashed #d1d5db;border-radius:8px;font-size:.82rem;">
             <div style="font-weight:700;margin-bottom:4px;">Élève déjà inscrit sans transport — quel tarif appliquer ?</div>
             <label style="display:block;margin-bottom:4px;"><input type="radio" name="edit_eleve_tarif_radio" value="supplement" checked onchange="document.getElementById('edit_eleve_tarif').value=this.value;document.dispatchEvent(new Event('input'))"> 🧮 <b>Calcul normal</b> : +200 DH (transport 300 DH − 100 DH de réduction ; +300 DH si l'élève n'a aucune réduction)</label>
             <label style="display:block;"><input type="radio" name="edit_eleve_tarif_radio" value="inclus" onchange="document.getElementById('edit_eleve_tarif').value=this.value;document.dispatchEvent(new Event('input'))"> 🔁 <b>Ancien tarif</b> : le montant convenu reste le même, transport inclus (ex : 1200 = 1100 scolarité + 100 transport)</label>
+          </div>
+          <div id="edit_eleve_tarif_sepwrap" style="margin-top:8px;padding:8px 10px;border:1px dashed #d1d5db;border-radius:8px;font-size:.82rem;">
+            <label style="display:flex;align-items:center;gap:6px;font-weight:700;cursor:pointer;"><input type="checkbox" id="edit_eleve_tarif_sepchk" onchange="toggleTransportEdit()"> ✏️ Saisir le montant du transport (ajouté à la facture)</label>
+            <div id="edit_eleve_tarif_sepbox" style="display:none;margin-top:6px;">
+              <label style="display:block;margin-bottom:4px;">🚌 Montant du transport / mois (MAD)</label>
+              <input type="number" step="0.01" min="0" name="montant_transport_separe" id="edit_eleve_tarif_sepmt" placeholder="Ex: 200" value="" style="max-width:220px;">
+              <div style="margin-top:4px;color:#6b7280;">Dans ce mode, le « montant convenu » ci-dessus = <b>scolarité seule</b>. Le montant saisi est comparé à la référence de 300 MAD : l'écart apparaît comme réduction sur la facture.</div>
+            </div>
           </div>
           <div id="edit_eleve_apercu" style="display:none;margin-top:8px;padding:8px 10px;background:#ecfdf5;border-radius:8px;font-size:.82rem;font-weight:600;"></div>
         </div>
@@ -46899,6 +47054,10 @@ html.theme-neon .me-al{ background:color-mix(in srgb,var(--c) 12%,rgba(18,18,32,
         document.getElementById('edit_eleve_allergies').value = allergies;
         document.getElementById('edit_eleve_contact_urgence_nom').value = contact_urgence_nom;
         document.getElementById('edit_eleve_contact_urgence_tel').value = contact_urgence_tel;
+        var _sepChk = document.getElementById('edit_eleve_tarif_sepchk'), _sepMt = document.getElementById('edit_eleve_tarif_sepmt');
+        var _estSep = (transport === 'oui' && transport_tarif === 'separe');
+        if (_sepChk) { _sepChk.checked = _estSep; }
+        if (_sepMt) { _sepMt.value = _estSep ? (Math.round((parseFloat(montant_transport) || 0) * (1 - (parseFloat(reduction_transport_pourcentage) || 0) / 100) * 100) / 100) : ''; }
         toggleTransportEdit();
         document.getElementById('modal-edit-eleve').style.display = 'block';
         window.scrollTo({top: 0, behavior: 'smooth'});
@@ -46930,7 +47089,13 @@ function transportApercu(selId, tarifId, apercuId, mId, cId) {
     var M = parseFloat(document.getElementById(mId).value) || 0, T = 300;
     var cRaw = document.getElementById(cId).value, c = parseFloat(cRaw), txt;
     var fmt = function (x) { return (Math.round(x * 100) / 100).toLocaleString('fr-FR'); };
-    if (tarif.value === 'supplement') {
+    if (tarif.value === 'separe') {
+        var _xs = document.getElementById(tarifId + '_sepmt'), _X = _xs ? (parseFloat(_xs.value) || 0) : 0;
+        var _s = (cRaw === '' || isNaN(c) || c >= M) ? M : c;
+        var _sr = (_s < M) ? (' (−' + fmt(M - _s) + ')') : '';
+        if (_X < T) { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(T) + ' (−' + fmt(T - _X) + ' de réduction) = ' + fmt(_s + _X) + ' MAD'; }
+        else { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(_X) + ' = ' + fmt(_s + _X) + ' MAD'; }
+    } else if (tarif.value === 'supplement') {
         if (cRaw === '' || isNaN(c) || c >= M) { txt = 'Scolarité ' + fmt(M) + ' + Transport ' + fmt(T) + ' = ' + fmt(M + T) + ' MAD (sans réduction)'; }
         else { txt = 'Scolarité ' + fmt(c) + ' + Transport ' + fmt(T - 100) + ' (300 − 100 de réduction) = ' + fmt(c + T - 100) + ' MAD'; }
     } else {
@@ -46947,13 +47112,38 @@ function transportRegleMaj(selId, divId, tarifId, choixId, apercuId, mId, cId) {
     var oui = (sel.value === 'oui');
     var div = document.getElementById(divId), tarif = document.getElementById(tarifId), choix = document.getElementById(choixId);
     var origOui = (sel.getAttribute('data-orig') === 'oui');
+    // 🆕 Types de calcul activés par l'admin (page Profil) : inclus = type 1, supplement = type 2, separe = type 3
+    var TT = {{ TRANSPORT_TYPES_ACTIFS|tojson }};
+    var dflt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'separe');
+    var alt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'inclus');
     if (div) div.style.display = oui ? 'block' : 'none';
+    if (choix) {
+        var radios = choix.querySelectorAll('input[type=radio]');
+        for (var i = 0; i < radios.length; i++) { if (radios[i].parentNode) radios[i].parentNode.style.display = TT[radios[i].value] ? '' : 'none'; }
+        var coche = choix.querySelector('input[type=radio]:checked');
+        if (!coche || !TT[coche.value]) { for (var j = 0; j < radios.length; j++) { if (TT[radios[j].value]) { radios[j].checked = true; break; } } }
+    }
     if (tarif) {
         if (!oui) { tarif.value = 'inclus'; }
-        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = r ? r.value : 'inclus'; }
+        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = (r && TT[r.value]) ? r.value : dflt; }
         else { tarif.value = sel.getAttribute('data-tarif') || 'legacy'; }
     }
-    if (choix) choix.style.display = (oui && !origOui) ? 'block' : 'none';
+    // 🆕 Option « montant de transport saisi » (type 3)
+    var chkS = document.getElementById(tarifId + '_sepchk'), boxS = document.getElementById(tarifId + '_sepbox'), infoS = document.getElementById(tarifId + '_infobox'), wrapS = document.getElementById(tarifId + '_sepwrap');
+    var forceSep = !!(oui && !origOui && !TT.inclus && !TT.supplement);
+    if (chkS) {
+        if (!oui) chkS.checked = false;
+        if (forceSep) { chkS.checked = true; chkS.disabled = true; } else { chkS.disabled = false; }
+    }
+    var sepOn = !!(oui && chkS && chkS.checked);
+    if (tarif && chkS) {
+        if (sepOn) { tarif.value = 'separe'; }
+        else if (tarif.value === 'separe') { tarif.value = alt; }
+    }
+    if (wrapS) wrapS.style.display = (TT.separe || (origOui && sel.getAttribute('data-tarif') === 'separe')) ? '' : 'none';
+    if (boxS) boxS.style.display = sepOn ? 'block' : 'none';
+    if (infoS) infoS.style.display = (sepOn || (oui && !origOui && !TT.inclus)) ? 'none' : '';
+    if (choix) choix.style.display = (oui && !origOui && !sepOn && TT.inclus && TT.supplement) ? 'block' : 'none';
     transportApercu(selId, tarifId, apercuId, mId, cId);
 }
     document.addEventListener('input', function () { transportApercu('edit_eleve_transport_abonne', 'edit_eleve_tarif', 'edit_eleve_apercu', 'edit_eleve_mensualite', 'edit_eleve_convenu'); });
@@ -55641,12 +55831,20 @@ document.addEventListener('DOMContentLoaded',function(){
 
                 <div class="form-group" id="detail_edit_div_montant" style="{{ '' if eleve.transport_abonne == 'oui' else 'display:none;' }}grid-column:1/-1;">
           <label>🚌 Transport</label>
-          <div style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;">{% if _t_legacy %}Abonné — montant : <b>{{ eleve.montant_transport }} MAD</b> (ancien tarif conservé){% else %}Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » inclut le transport (100 MAD net + 200 MAD de réduction){% endif %}</div>
+          <div id="detail_edit_tarif_infobox" style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;{{ 'display:none;' if (eleve.transport_abonne == 'oui' and eleve.transport_tarif == 'separe') else '' }}">{% if _t_legacy %}Abonné — montant : <b>{{ eleve.montant_transport }} MAD</b> (ancien tarif conservé){% else %}Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » inclut le transport (100 MAD net + 200 MAD de réduction){% endif %}</div>
           <input type="hidden" name="transport_tarif" id="detail_edit_tarif" value="{{ (eleve.transport_tarif or 'legacy') if eleve.transport_abonne == 'oui' else 'inclus' }}">
           <div id="detail_edit_choix" style="display:none;margin-top:8px;padding:8px 10px;border:1px dashed #d1d5db;border-radius:8px;font-size:.82rem;">
             <div style="font-weight:700;margin-bottom:4px;">Élève déjà inscrit sans transport — quel tarif appliquer ?</div>
             <label style="display:block;margin-bottom:4px;"><input type="radio" name="detail_edit_tarif_radio" value="supplement" checked onchange="document.getElementById('detail_edit_tarif').value=this.value;document.dispatchEvent(new Event('input'))"> 🧮 <b>Calcul normal</b> : +200 DH (transport 300 DH − 100 DH de réduction ; +300 DH si l'élève n'a aucune réduction)</label>
             <label style="display:block;"><input type="radio" name="detail_edit_tarif_radio" value="inclus" onchange="document.getElementById('detail_edit_tarif').value=this.value;document.dispatchEvent(new Event('input'))"> 🔁 <b>Ancien tarif</b> : le montant convenu reste le même, transport inclus (ex : 1200 = 1100 scolarité + 100 transport)</label>
+          </div>
+          <div id="detail_edit_tarif_sepwrap" style="margin-top:8px;padding:8px 10px;border:1px dashed #d1d5db;border-radius:8px;font-size:.82rem;">
+            <label style="display:flex;align-items:center;gap:6px;font-weight:700;cursor:pointer;"><input type="checkbox" id="detail_edit_tarif_sepchk" {{ 'checked' if (eleve.transport_abonne == 'oui' and eleve.transport_tarif == 'separe') else '' }} onchange="toggleTransportDetailEdit()"> ✏️ Saisir le montant du transport (ajouté à la facture)</label>
+            <div id="detail_edit_tarif_sepbox" style="{{ 'display:block;' if (eleve.transport_abonne == 'oui' and eleve.transport_tarif == 'separe') else 'display:none;' }}margin-top:6px;">
+              <label style="display:block;margin-bottom:4px;">🚌 Montant du transport / mois (MAD)</label>
+              <input type="number" step="0.01" min="0" name="montant_transport_separe" id="detail_edit_tarif_sepmt" placeholder="Ex: 200" value="{{ (((eleve.montant_transport or 0) * (1 - (eleve.reduction_transport_pourcentage or 0) / 100)) | round(2)) if (eleve.transport_abonne == 'oui' and eleve.transport_tarif == 'separe') else '' }}" style="max-width:220px;">
+              <div style="margin-top:4px;color:#6b7280;">Dans ce mode, le « montant convenu » ci-dessus = <b>scolarité seule</b>. Le montant saisi est comparé à la référence de 300 MAD : l'écart apparaît comme réduction sur la facture.</div>
+            </div>
           </div>
           <div id="detail_edit_apercu" style="display:none;margin-top:8px;padding:8px 10px;background:#ecfdf5;border-radius:8px;font-size:.82rem;font-weight:600;"></div>
         </div>
@@ -55801,7 +55999,13 @@ function transportApercu(selId, tarifId, apercuId, mId, cId) {
     var M = parseFloat(document.getElementById(mId).value) || 0, T = 300;
     var cRaw = document.getElementById(cId).value, c = parseFloat(cRaw), txt;
     var fmt = function (x) { return (Math.round(x * 100) / 100).toLocaleString('fr-FR'); };
-    if (tarif.value === 'supplement') {
+    if (tarif.value === 'separe') {
+        var _xs = document.getElementById(tarifId + '_sepmt'), _X = _xs ? (parseFloat(_xs.value) || 0) : 0;
+        var _s = (cRaw === '' || isNaN(c) || c >= M) ? M : c;
+        var _sr = (_s < M) ? (' (−' + fmt(M - _s) + ')') : '';
+        if (_X < T) { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(T) + ' (−' + fmt(T - _X) + ' de réduction) = ' + fmt(_s + _X) + ' MAD'; }
+        else { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(_X) + ' = ' + fmt(_s + _X) + ' MAD'; }
+    } else if (tarif.value === 'supplement') {
         if (cRaw === '' || isNaN(c) || c >= M) { txt = 'Scolarité ' + fmt(M) + ' + Transport ' + fmt(T) + ' = ' + fmt(M + T) + ' MAD (sans réduction)'; }
         else { txt = 'Scolarité ' + fmt(c) + ' + Transport ' + fmt(T - 100) + ' (300 − 100 de réduction) = ' + fmt(c + T - 100) + ' MAD'; }
     } else {
@@ -55818,13 +56022,38 @@ function transportRegleMaj(selId, divId, tarifId, choixId, apercuId, mId, cId) {
     var oui = (sel.value === 'oui');
     var div = document.getElementById(divId), tarif = document.getElementById(tarifId), choix = document.getElementById(choixId);
     var origOui = (sel.getAttribute('data-orig') === 'oui');
+    // 🆕 Types de calcul activés par l'admin (page Profil) : inclus = type 1, supplement = type 2, separe = type 3
+    var TT = {{ TRANSPORT_TYPES_ACTIFS|tojson }};
+    var dflt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'separe');
+    var alt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'inclus');
     if (div) div.style.display = oui ? 'block' : 'none';
+    if (choix) {
+        var radios = choix.querySelectorAll('input[type=radio]');
+        for (var i = 0; i < radios.length; i++) { if (radios[i].parentNode) radios[i].parentNode.style.display = TT[radios[i].value] ? '' : 'none'; }
+        var coche = choix.querySelector('input[type=radio]:checked');
+        if (!coche || !TT[coche.value]) { for (var j = 0; j < radios.length; j++) { if (TT[radios[j].value]) { radios[j].checked = true; break; } } }
+    }
     if (tarif) {
         if (!oui) { tarif.value = 'inclus'; }
-        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = r ? r.value : 'inclus'; }
+        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = (r && TT[r.value]) ? r.value : dflt; }
         else { tarif.value = sel.getAttribute('data-tarif') || 'legacy'; }
     }
-    if (choix) choix.style.display = (oui && !origOui) ? 'block' : 'none';
+    // 🆕 Option « montant de transport saisi » (type 3)
+    var chkS = document.getElementById(tarifId + '_sepchk'), boxS = document.getElementById(tarifId + '_sepbox'), infoS = document.getElementById(tarifId + '_infobox'), wrapS = document.getElementById(tarifId + '_sepwrap');
+    var forceSep = !!(oui && !origOui && !TT.inclus && !TT.supplement);
+    if (chkS) {
+        if (!oui) chkS.checked = false;
+        if (forceSep) { chkS.checked = true; chkS.disabled = true; } else { chkS.disabled = false; }
+    }
+    var sepOn = !!(oui && chkS && chkS.checked);
+    if (tarif && chkS) {
+        if (sepOn) { tarif.value = 'separe'; }
+        else if (tarif.value === 'separe') { tarif.value = alt; }
+    }
+    if (wrapS) wrapS.style.display = (TT.separe || (origOui && sel.getAttribute('data-tarif') === 'separe')) ? '' : 'none';
+    if (boxS) boxS.style.display = sepOn ? 'block' : 'none';
+    if (infoS) infoS.style.display = (sepOn || (oui && !origOui && !TT.inclus)) ? 'none' : '';
+    if (choix) choix.style.display = (oui && !origOui && !sepOn && TT.inclus && TT.supplement) ? 'block' : 'none';
     transportApercu(selId, tarifId, apercuId, mId, cId);
 }
 document.addEventListener('input', function () { transportApercu('detail_edit_transport', 'detail_edit_tarif', 'detail_edit_apercu', 'detail_edit_mensualite', 'detail_edit_convenu'); });
@@ -56280,8 +56509,16 @@ ADD_ELEVE_HTML = """<!DOCTYPE html><html><head><title>Ajouter élève</title>"""
         </div>
         <div class="form-group" id="add_page_div_montant" style="display:none;grid-column:1/-1;">
           <label>🚌 Transport</label>
-          <div style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;">Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » ci-dessus inclut le transport (100 MAD net + 200 MAD de réduction).</div>
+          <div id="add_page_tarif_infobox" style="padding:8px 10px;background:#f3f4f6;border-radius:8px;font-size:.85rem;">Montant fixe : <b>300 MAD / mois</b>. Le « montant convenu » ci-dessus inclut le transport (100 MAD net + 200 MAD de réduction).</div>
           <input type="hidden" name="transport_tarif" id="add_page_tarif" value="inclus">
+          <div id="add_page_tarif_sepwrap" style="margin-top:8px;padding:8px 10px;border:1px dashed #d1d5db;border-radius:8px;font-size:.82rem;">
+            <label style="display:flex;align-items:center;gap:6px;font-weight:700;cursor:pointer;"><input type="checkbox" id="add_page_tarif_sepchk" onchange="toggleTransportPageAdd()"> ✏️ Saisir le montant du transport (ajouté à la facture)</label>
+            <div id="add_page_tarif_sepbox" style="display:none;margin-top:6px;">
+              <label style="display:block;margin-bottom:4px;">🚌 Montant du transport / mois (MAD)</label>
+              <input type="number" step="0.01" min="0" name="montant_transport_separe" id="add_page_tarif_sepmt" placeholder="Ex: 200" value="" style="max-width:220px;">
+              <div style="margin-top:4px;color:#6b7280;">Dans ce mode, le « montant convenu » ci-dessus = <b>scolarité seule</b>. Le montant saisi est comparé à la référence de 300 MAD : l'écart apparaît comme réduction sur la facture.</div>
+            </div>
+          </div>
           <div id="add_page_apercu" style="display:none;margin-top:8px;padding:8px 10px;background:#ecfdf5;border-radius:8px;font-size:.82rem;font-weight:600;"></div>
         </div>
         <div class="form-group"><label>Groupe sanguin</label>
@@ -56361,7 +56598,13 @@ function transportApercu(selId, tarifId, apercuId, mId, cId) {
     var M = parseFloat(document.getElementById(mId).value) || 0, T = 300;
     var cRaw = document.getElementById(cId).value, c = parseFloat(cRaw), txt;
     var fmt = function (x) { return (Math.round(x * 100) / 100).toLocaleString('fr-FR'); };
-    if (tarif.value === 'supplement') {
+    if (tarif.value === 'separe') {
+        var _xs = document.getElementById(tarifId + '_sepmt'), _X = _xs ? (parseFloat(_xs.value) || 0) : 0;
+        var _s = (cRaw === '' || isNaN(c) || c >= M) ? M : c;
+        var _sr = (_s < M) ? (' (−' + fmt(M - _s) + ')') : '';
+        if (_X < T) { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(T) + ' (−' + fmt(T - _X) + ' de réduction) = ' + fmt(_s + _X) + ' MAD'; }
+        else { txt = 'Scolarité ' + fmt(M) + _sr + ' + Transport ' + fmt(_X) + ' = ' + fmt(_s + _X) + ' MAD'; }
+    } else if (tarif.value === 'supplement') {
         if (cRaw === '' || isNaN(c) || c >= M) { txt = 'Scolarité ' + fmt(M) + ' + Transport ' + fmt(T) + ' = ' + fmt(M + T) + ' MAD (sans réduction)'; }
         else { txt = 'Scolarité ' + fmt(c) + ' + Transport ' + fmt(T - 100) + ' (300 − 100 de réduction) = ' + fmt(c + T - 100) + ' MAD'; }
     } else {
@@ -56378,13 +56621,38 @@ function transportRegleMaj(selId, divId, tarifId, choixId, apercuId, mId, cId) {
     var oui = (sel.value === 'oui');
     var div = document.getElementById(divId), tarif = document.getElementById(tarifId), choix = document.getElementById(choixId);
     var origOui = (sel.getAttribute('data-orig') === 'oui');
+    // 🆕 Types de calcul activés par l'admin (page Profil) : inclus = type 1, supplement = type 2, separe = type 3
+    var TT = {{ TRANSPORT_TYPES_ACTIFS|tojson }};
+    var dflt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'separe');
+    var alt = TT.inclus ? 'inclus' : (TT.supplement ? 'supplement' : 'inclus');
     if (div) div.style.display = oui ? 'block' : 'none';
+    if (choix) {
+        var radios = choix.querySelectorAll('input[type=radio]');
+        for (var i = 0; i < radios.length; i++) { if (radios[i].parentNode) radios[i].parentNode.style.display = TT[radios[i].value] ? '' : 'none'; }
+        var coche = choix.querySelector('input[type=radio]:checked');
+        if (!coche || !TT[coche.value]) { for (var j = 0; j < radios.length; j++) { if (TT[radios[j].value]) { radios[j].checked = true; break; } } }
+    }
     if (tarif) {
         if (!oui) { tarif.value = 'inclus'; }
-        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = r ? r.value : 'inclus'; }
+        else if (!origOui) { var r = choix ? choix.querySelector('input[type=radio]:checked') : null; tarif.value = (r && TT[r.value]) ? r.value : dflt; }
         else { tarif.value = sel.getAttribute('data-tarif') || 'legacy'; }
     }
-    if (choix) choix.style.display = (oui && !origOui) ? 'block' : 'none';
+    // 🆕 Option « montant de transport saisi » (type 3)
+    var chkS = document.getElementById(tarifId + '_sepchk'), boxS = document.getElementById(tarifId + '_sepbox'), infoS = document.getElementById(tarifId + '_infobox'), wrapS = document.getElementById(tarifId + '_sepwrap');
+    var forceSep = !!(oui && !origOui && !TT.inclus && !TT.supplement);
+    if (chkS) {
+        if (!oui) chkS.checked = false;
+        if (forceSep) { chkS.checked = true; chkS.disabled = true; } else { chkS.disabled = false; }
+    }
+    var sepOn = !!(oui && chkS && chkS.checked);
+    if (tarif && chkS) {
+        if (sepOn) { tarif.value = 'separe'; }
+        else if (tarif.value === 'separe') { tarif.value = alt; }
+    }
+    if (wrapS) wrapS.style.display = (TT.separe || (origOui && sel.getAttribute('data-tarif') === 'separe')) ? '' : 'none';
+    if (boxS) boxS.style.display = sepOn ? 'block' : 'none';
+    if (infoS) infoS.style.display = (sepOn || (oui && !origOui && !TT.inclus)) ? 'none' : '';
+    if (choix) choix.style.display = (oui && !origOui && !sepOn && TT.inclus && TT.supplement) ? 'block' : 'none';
     transportApercu(selId, tarifId, apercuId, mId, cId);
 }
 document.addEventListener('input', function () { transportApercu('page_add_transport', 'add_page_tarif', 'add_page_apercu', 'add_page_mensualite', 'add_page_convenu'); });
@@ -78724,6 +78992,41 @@ PROFILE_HTML = """<!DOCTYPE html><html><head><title>Profil</title>""" + BASE_CSS
       {% endfor %}
       <button type="submit" class="btn btn-primary" style="margin-top:8px;">💾 Enregistrer</button>
     </form>
+  </div>
+</div>
+
+<!-- 🆕 Types de calcul du transport (admin) : activer / désactiver les types proposés dans les formulaires élève -->
+<div class="card" style="max-width:560px; margin-top:20px;">
+  <div class="card-header"><h3>🚌 Types de calcul du transport</h3></div>
+  <div class="card-body">
+    <p style="font-size:.85rem;color:var(--gray-500);line-height:1.6;margin-bottom:14px;">Choisissez les types de calcul proposés lorsqu'un élève est abonné au transport (référence : 300 MAD / mois). Les élèves déjà enregistrés gardent leur type actuel. Au moins un type doit rester activé.</p>
+    <form method="post" id="form-transport-types">
+      <input type="hidden" name="action" value="transport_types">
+      <label style="display:flex;gap:10px;align-items:flex-start;margin-bottom:12px;cursor:pointer;">
+        <input type="checkbox" name="type_inclus" value="1" class="tt-chk" {{ 'checked' if TRANSPORT_TYPES_ACTIFS.inclus else '' }} style="margin-top:4px;">
+        <span><b>Type 1</b> — transport à <b>100 MAD</b> (300 − 200 de réduction)<br><span style="font-size:.8rem;color:var(--gray-500);">Le « montant convenu » inclut le transport.</span></span>
+      </label>
+      <label style="display:flex;gap:10px;align-items:flex-start;margin-bottom:12px;cursor:pointer;">
+        <input type="checkbox" name="type_supplement" value="1" class="tt-chk" {{ 'checked' if TRANSPORT_TYPES_ACTIFS.supplement else '' }} style="margin-top:4px;">
+        <span><b>Type 2</b> — transport à <b>200 MAD</b> (300 − 100 de réduction)<br><span style="font-size:.8rem;color:var(--gray-500);">Le transport s'ajoute au montant convenu de scolarité.</span></span>
+      </label>
+      <label style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px;cursor:pointer;">
+        <input type="checkbox" name="type_separe" value="1" class="tt-chk" {{ 'checked' if TRANSPORT_TYPES_ACTIFS.separe else '' }} style="margin-top:4px;">
+        <span><b>Type 3</b> — montant du transport <b>saisi</b> par l'utilisateur<br><span style="font-size:.8rem;color:var(--gray-500);">Comparé à la référence de 300 MAD : l'écart devient la réduction sur la facture.</span></span>
+      </label>
+      <button type="submit" class="btn btn-primary">💾 Enregistrer</button>
+    </form>
+    <script>
+    (function () {
+        var chks = document.querySelectorAll('#form-transport-types .tt-chk');
+        chks.forEach(function (c) {
+            c.addEventListener('change', function () {
+                var n = 0; chks.forEach(function (x) { if (x.checked) n++; });
+                if (n === 0) { c.checked = true; alert('Au moins un type de calcul du transport doit rester activé.'); }
+            });
+        });
+    })();
+    </script>
   </div>
 </div>
 
